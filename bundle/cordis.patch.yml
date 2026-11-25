@@ -1,0 +1,9 @@
+- insert:
+    - id: failure-guard
+      name: 'dsh-failure-guard'
+      config:
+        failThreshold: 3
+        cooldownMs: 60000
+        repeatLimit: 3
+        repeatWindowMs: 600000
+        grounding: true
