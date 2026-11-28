@@ -1,5 +1,5 @@
 /**
- * loop-guard —— 工具调用的那道闸
+ * failure-guard —— 工具调用的那道闸
  *
  * 三件事：
  * 1) 同一个调用（工具名 + 参数）反复撞同一个墙：第 N 次就拦下，告诉它「这条路不会自己变好」。
@@ -9,7 +9,7 @@
  * 另外给系统提示加一条常驻的地基话术（可以关）。
  */
 
-export const name = 'loop-guard'
+export const name = 'failure-guard'
 
 export const inject = ['tools', 'systemPrompt']
 
@@ -18,8 +18,11 @@ const DEFAULTS = {
   cooldownMs: 60_000,
   repeatLimit: 3,
   repeatWindowMs: 10 * 60_000,
+  burstLimit: 12,
   grounding: true,
   exempt: ['windows_desktop'],
+  // 按工具的配额：`工具名 -> { max, windowMs }`。改参数也绕不过去。
+  quotas: {},
 }
 
 /** 稳定序列化：对象的键排序，避免 {a,b} 与 {b,a} 被当成两个调用。 */
@@ -58,6 +61,10 @@ export function apply(ctx, config = {}) {
   const breakers = new Map()
   /** 重复账：`agent|指纹` -> { count, firstAt, lastAt, denied } */
   const repeats = new Map()
+  /** 连打账：`agent` -> { tool, streak } */
+  const bursts = new Map()
+  /** 配额账：`agent|tool` -> number[]（调用时间戳） */
+  const quotaHits = new Map()
 
   const agentOf = (exec) => String(exec?.agent?.id ?? 'shared')
 
@@ -98,10 +105,50 @@ export function apply(ctx, config = {}) {
     // 1) 熔断
     const b = breakerCheck(agent, tool, t)
     if (!b.allowed) {
-      return { kind: 'deny', reason: b.reason, info: { name: 'loop-guard', code: b.code } }
+      return { kind: 'deny', reason: b.reason, info: { name: 'failure-guard', code: b.code } }
     }
 
-    // 2) 同一个调用反复撞
+    // 2) 按工具的时间窗配额（改参数也绕不过）
+    const quota = cfg.quotas?.[tool]
+    if (quota && quota.max > 0) {
+      const key = agent + '|' + tool
+      const now = t
+      const hits = (quotaHits.get(key) ?? []).filter((x) => now - x < quota.windowMs)
+      if (hits.length >= quota.max) {
+        const waitSec = Math.ceil((quota.windowMs - (now - hits[0])) / 1000)
+        return {
+          kind: 'deny',
+          reason:
+            `工具 「${tool}」 的配额用完了：${Math.round(quota.windowMs / 60000)} 分钟内最多 ${quota.max} 次，已经用完，还要等 ${waitSec} 秒。` +
+            '这不是参数问题，换参数也绕不过。先用文字说明你手上有什么，或者等一会儿再来。',
+          info: { name: 'failure-guard', code: 'TOOL_QUOTA' },
+        }
+      }
+      hits.push(now)
+      quotaHits.set(key, hits)
+    }
+
+    // 3) 同一个工具一口气连打太多次：拒一次，逼它先说一句
+    if (cfg.burstLimit > 0) {
+      let burst = bursts.get(agent)
+      if (!burst || burst.tool !== tool) {
+        burst = { tool, streak: 0 }
+        bursts.set(agent, burst)
+      }
+      burst.streak += 1
+      if (burst.streak > cfg.burstLimit) {
+        burst.streak = 0
+        return {
+          kind: 'deny',
+          reason:
+            `工具 「${tool}」 在这一轮里已经连着打了 ${cfg.burstLimit} 次，中间一句话都没说。` +
+            '先说一句你现在在干什么、还差什么，再继续。',
+          info: { name: 'failure-guard', code: 'TOOL_BURST' },
+        }
+      }
+    }
+
+    // 3) 同一个调用反复撞
     const fp = agent + '|' + fingerprint(tool, exec?.arguments)
     let row = repeats.get(fp)
     if (!row || t - row.firstAt > cfg.repeatWindowMs) {
@@ -119,7 +166,7 @@ export function apply(ctx, config = {}) {
         reason:
           `同一个调用（工具 「${tool}」 同一份参数）这已经是第 ${row.count} 次了，前 ${row.count - 1} 次的结果不会因为再来一次而改变。` +
           '换参数、换工具，或者停下来把情况说清楚。',
-        info: { name: 'loop-guard', code: 'REPEAT_CALL' },
+        info: { name: 'failure-guard', code: 'REPEAT_CALL' },
       }
     }
 
@@ -148,7 +195,7 @@ export function apply(ctx, config = {}) {
     }
 
     // 被我们自己拦下的不算「工具自己失败」，否则熔断会被自己的回执喂大
-    if (result?.error?.info?.name === 'loop-guard') return decision
+    if (result?.error?.info?.name === 'failure-guard') return decision
 
     // —— 失败：记账 + 改回执 ——
     const key = agent + '|' + tool
@@ -166,7 +213,7 @@ export function apply(ctx, config = {}) {
     const code = info?.code ?? 'ERROR'
     const held = row.openUntil && row.openUntil > t
     const note =
-      `[loop-guard] 这次调用是失败的（工具 ${tool}，code=${code}），不是拿到了结果。` +
+      `[failure-guard] 这次调用是失败的（工具 ${tool}，code=${code}），不是拿到了结果。` +
       '不要假设它成功，也不要拿这行报错当答案去编内容。' +
       '换参数或换工具再试；如果这条路已经试过两次，就改用文字说明你拿不到什么。' +
       (held ? ` 这个工具已达到连续失败 ${row.fails} 次，接下来 ${Math.ceil((row.openUntil - t) / 1000)} 秒内会被熔断拦下。` : '')
@@ -184,7 +231,7 @@ export function apply(ctx, config = {}) {
       order = 100
     }
     ctx.systemPrompt.context({
-      name: 'loop-guard.grounding',
+      name: 'failure-guard.grounding',
       order,
       text:
         '工具报错就是失败，不是结果。没拿到就说没拿到，不要用报错去编内容；' +

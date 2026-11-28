@@ -6,4 +6,9 @@
         cooldownMs: 60000
         repeatLimit: 3
         repeatWindowMs: 600000
+        burstLimit: 12
         grounding: true
+        quotas:
+          mcp__windows__Screenshot:
+            max: 10
+            windowMs: 600000

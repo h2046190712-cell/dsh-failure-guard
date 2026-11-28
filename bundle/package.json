@@ -1,6 +1,6 @@
 {
   "name": "dsh-failure-guard",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": false,
   "type": "module",
   "description": "给工具调用装一道闸：同一个调用别反复撞、失败到顶就熔断、失败回执写清楚这是失败。",
